@@ -1,0 +1,28 @@
+{
+  "verdict": "PASS",
+  "thresholds": {
+    "after_max_tick_gap_ms_lt": 10,
+    "before_max_tick_gap_ms_ge": 100,
+    "after_ticks_during_tls_gt": 40,
+    "before_ticks_during_tls_eq": 0
+  },
+  "before": {
+    "max_tick_gap_ms": 501.302,
+    "avg_tick_gap_ms": 3.6999,
+    "ticks_during_tls": 0,
+    "tls_completed": true
+  },
+  "after": {
+    "max_tick_gap_ms": 9.019,
+    "avg_tick_gap_ms": 1.51942,
+    "ticks_during_tls": 48,
+    "tls_completed": true
+  },
+  "checks": {
+    "tls_completed_both": true,
+    "before_shows_blocking": true,
+    "after_unblocked": true,
+    "before_ticks_during_tls_eq_0": true,
+    "after_ticks_during_tls_gt_40": true
+  }
+}

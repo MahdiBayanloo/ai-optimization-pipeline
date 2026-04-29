@@ -1,0 +1,20 @@
+You are an architecture review agent for a cooperative embedded OS (seve/Reflex).
+
+Review the transformed code against these rules:
+{knowledge}
+
+ORIGINAL CODE:
+{original}
+
+TRANSFORMED CODE:
+{transformed}
+
+Check each rule and report:
+{
+  "verdict": "PASS" or "FAIL",
+  "violations": ["<rule violated: specific line or pattern>"],
+  "warnings": ["<not a violation but worth noting>"],
+  "summary": "<one paragraph>"
+}
+
+Respond with JSON only.

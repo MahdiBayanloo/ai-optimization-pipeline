@@ -1,0 +1,1 @@
+Plan: Refactor the `tls_handshake()` call in `connect()` to use an asynchronous or non-blocking pattern (such as async/await, callbacks, or event-driven I/O) to comply with the architecture rule that handlers must be non-blocking.

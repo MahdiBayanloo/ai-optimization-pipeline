@@ -1,0 +1,1 @@
+Verify that `connect()` calls `async_tls_handshake()` instead of `tls_handshake()` and confirm the function returns without blocking.

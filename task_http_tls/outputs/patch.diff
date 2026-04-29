@@ -1,0 +1,399 @@
+```cpp
+// TlsHandshakeAdapter.h
+/*
+Copyright Perinet GmbH. All Rights Reserved.
+
+This software is dual-licensed: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License version 3 as
+published by the Free Software Foundation. For the terms of this
+license, see http://www.fsf.org/licensing/licenses/agpl-3.0.html,
+or contact us at https://perinet.io/contact/ when you want license
+this software under a commercial license.
+*/
+
+#pragma once
+
+extern "C" {
+#ifdef __GNUC__
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wpedantic"
+#endif  // __GNUC__
+#include "cyclone_tcp/core/net.h"
+#include "cyclone_tcp/http/http_server.h"
+#include "cyclone_ssl/tls.h"
+#ifdef __GNUC__
+  #pragma GCC diagnostic pop
+#endif  // __GNUC__
+}
+
+#include <functional>
+
+// Pattern 3: Callback Wrapper - Status enum for non-blocking handshake progress
+enum class TlsHandshakeStatus {
+    IN_PROGRESS,  // Handshake ongoing, call progress() again next tick
+    DONE,         // Handshake completed successfully
+    ERROR         // Handshake failed, check getError() for details
+};
+
+// Pattern 1: State Machine - Internal sub-states for TLS handshake decomposition
+enum class TlsHandshakeSubState {
+    IDLE,                  // Not started
+    SOCKET_SETUP,          // Configure socket for non-blocking
+    TLS_INIT,              // TLS context initialization
+    TLS_CLIENT_HELLO,      // Waiting for/processing ClientHello
+    TLS_NEGOTIATING,       // Key exchange and negotiation in progress
+    TLS_FINISHING,         // Final handshake messages
+    COMPLETED,             // Handshake done
+    FAILED                 // Error occurred
+};
+
+// Pattern 2: Adapter Layer - Wraps CycloneTCP TLS behind non-blocking interface
+// This class is the ONLY place CycloneTCP TLS functions are called from
+class TlsHandshakeAdapter {
+public:
+    using CompletionCallback = std::function<void(error_t result)>;
+
+    TlsHandshakeAdapter() 
+        : connection_(nullptr)
+        , subState_(TlsHandshakeSubState::IDLE)
+        , lastError_(NO_ERROR)
+        , progressCallCount_(0)
+    {
+        // State stored in member variables, not on call stack between ticks
+    }
+
+    ~TlsHandshakeAdapter() = default;
+
+    // Non-copyable - adapter instance tied to single connection
+    TlsHandshakeAdapter(const TlsHandshakeAdapter&) = delete;
+    TlsHandshakeAdapter& operator=(const TlsHandshakeAdapter&) = delete;
+
+    // Pattern 3: start() kicks off operation and returns immediately
+    // NO blocking calls here - just initialization
+    error_t start(HttpConnection* connection) {
+        if (connection == nullptr) {
+            lastError_ = ERROR_INVALID_PARAMETER;
+            subState_ = TlsHandshakeSubState::FAILED;
+            return lastError_;
+        }
+
+        connection_ = connection;
+        subState_ = TlsHandshakeSubState::SOCKET_SETUP;
+        lastError_ = NO_ERROR;
+        progressCallCount_ = 0;
+
+        // Return immediately - actual work happens in progress()
+        return NO_ERROR;
+    }
+
+    // Pattern 3: progress() called each event loop tick - does ONE small step
+    // Returns status to caller, never blocks
+    TlsHandshakeStatus progress() {
+        if (connection_ == nullptr) {
+            lastError_ = ERROR_INVALID_PARAMETER;
+            subState_ = TlsHandshakeSubState::FAILED;
+            return TlsHandshakeStatus::ERROR;
+        }
+
+        progressCallCount_++;
+
+        // Pattern 1: State machine - each state does ONE unit of work and returns
+        switch (subState_) {
+            case TlsHandshakeSubState::IDLE:
+                // Not started yet
+                return TlsHandshakeStatus::IN_PROGRESS;
+
+            case TlsHandshakeSubState::SOCKET_SETUP:
+                // Configure socket for non-blocking operation
+                return doSocketSetup();
+
+            case TlsHandshakeSubState::TLS_INIT:
+                // TLS context should already be initialized via httpServerOpenSecureConnection
+                // Advance to negotiation phase
+                subState_ = TlsHandshakeSubState::TLS_NEGOTIATING;
+                return TlsHandshakeStatus::IN_PROGRESS;
+
+            case TlsHandshakeSubState::TLS_CLIENT_HELLO:
+            case TlsHandshakeSubState::TLS_NEGOTIATING:
+            case TlsHandshakeSubState::TLS_FINISHING:
+                // All negotiation phases handled by single tlsConnect call
+                // CycloneTCP manages internal TLS state machine
+                return doTlsConnect();
+
+            case TlsHandshakeSubState::COMPLETED:
+                return TlsHandshakeStatus::DONE;
+
+            case TlsHandshakeSubState::FAILED:
+                return TlsHandshakeStatus::ERROR;
+
+            default:
+                lastError_ = ERROR_UNEXPECTED_STATE;
+                subState_ = TlsHandshakeSubState::FAILED;
+                return TlsHandshakeStatus::ERROR;
+        }
+    }
+
+    // Pattern 3: Register completion callback for event channel delivery
+    void setOnComplete(CompletionCallback callback) {
+        onCompleteCallback_ = std::move(callback);
+    }
+
+    // Fire the completion callback - called by activity handler when DONE or ERROR
+    void fireCompletion() {
+        if (onCompleteCallback_) {
+            onCompleteCallback_(lastError_);
+        }
+    }
+
+    // Retrieve error code when status is ERROR
+    error_t getError() const {
+        return lastError_;
+    }
+
+    // Get current sub-state for debugging/monitoring
+    TlsHandshakeSubState getSubState() const {
+        return subState_;
+    }
+
+    // Get progress call count for timeout detection
+    uint32_t getProgressCallCount() const {
+        return progressCallCount_;
+    }
+
+private:
+    // Pattern 2: All CycloneTCP calls isolated inside adapter methods
+
+    // Configure socket for non-blocking operation
+    TlsHandshakeStatus doSocketSetup() {
+        // Set socket to non-blocking mode so tlsConnect won't block
+        // This is the minimal CycloneTCP interaction needed
+        error_t error = socketSetTimeout(connection_->socket, 0);
+        
+        if (error != NO_ERROR && error != ERROR_TIMEOUT) {
+            // Some socket implementations return timeout for non-blocking set
+            lastError_ = error;
+            subState_ = TlsHandshakeSubState::FAILED;
+            return TlsHandshakeStatus::ERROR;
+        }
+
+        // Advance to TLS initialization
+        subState_ = TlsHandshakeSubState::TLS_INIT;
+        return TlsHandshakeStatus::IN_PROGRESS;
+    }
+
+    // Perform one iteration of TLS handshake
+    // CycloneTCP's tlsConnect handles the internal TLS state machine
+    TlsHandshakeStatus doTlsConnect() {
+        if (connection_->tlsContext == nullptr) {
+            lastError_ = ERROR_INVALID_PARAMETER;
+            subState_ = TlsHandshakeSubState::FAILED;
+            return TlsHandshakeStatus::ERROR;
+        }
+
+        // Pattern 2: CycloneTCP call isolated here
+        // tlsConnect with non-blocking socket will return immediately
+        // with ERROR_WOULD_BLOCK if handshake not complete
+        error_t error = tlsConnect(connection_->tlsContext);
+
+        if (error == NO_ERROR) {
+            // Handshake completed successfully
+            subState_ = TlsHandshakeSubState::COMPLETED;
+            lastError_ = NO_ERROR;
+            
+            // Restore socket timeout for normal HTTP operations
+            socketSetTimeout(connection_->socket, 
+                connection_->serverContext->settings.connectionTimeout);
+            
+            return TlsHandshakeStatus::DONE;
+        }
+        else if (error == ERROR_WOULD_BLOCK) {
+            // Handshake in progress - need more data or socket not ready
+            // Return to event loop, will be called again next tick
+            // NO busy-wait - we return immediately
+            return TlsHandshakeStatus::IN_PROGRESS;
+        }
+        else {
+            // Actual error occurred
+            lastError_ = error;
+            subState_ = TlsHandshakeSubState::FAILED;
+            return TlsHandshakeStatus::ERROR;
+        }
+    }
+
+    // Member variables - all state stored here, never on call stack between ticks
+    HttpConnection* connection_;
+    TlsHandshakeSubState subState_;
+    error_t lastError_;
+    uint32_t progressCallCount_;
+    CompletionCallback onCompleteCallback_;
+};
+
+
+// Extended HTTP connection states for TLS handshake state machine
+// These extend the existing HttpConnState enum conceptually
+// (actual enum extension would be in http_server.h or a local wrapper)
+#ifndef HTTP_CONN_STATE_TLS_EXTENDED
+#define HTTP_CONN_STATE_TLS_EXTENDED
+
+// Note: These values should be added to HttpConnState enum in http_server.h
+// or handled via a separate tracking mechanism to minimize vendor code changes
+constexpr int HTTP_CONNECTION_STATE_TLS_STARTING = 100;    // Adapter.start() called
+constexpr int HTTP_CONNECTION_STATE_TLS_IN_PROGRESS = 101; // Adapter.progress() ongoing  
+constexpr int HTTP_CONNECTION_STATE_TLS_COMPLETE = 102;    // Handshake succeeded
+constexpr int HTTP_CONNECTION_STATE_TLS_ERROR = 103;       // Handshake failed
+
+#endif // HTTP_CONN_STATE_TLS_EXTENDED
+```
+
+```cpp
+// ConnectionHelper.h
+/*
+Copyright Perinet GmbH. All Rights Reserved.
+
+This software is dual-licensed: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License version 3 as
+published by the Free Software Foundation. For the terms of this
+license, see http://www.fsf.org/licensing/licenses/agpl-3.0.html,
+or contact us at https://perinet.io/contact/ when you want license
+this software under a commercial license.
+*/
+
+#pragma once
+
+extern "C" {
+#ifdef __GNUC__
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wpedantic"
+#endif  // __GNUC__
+#include "cyclone_tcp/core/net.h"
+#include "cyclone_tcp/http/http_server.h"
+#ifdef __GNUC__
+  #pragma GCC diagnostic pop
+#endif  // __GNUC__
+
+
+// Existing synchronous functions - preserved for backward compatibility
+// WARNING: httpServerEstablishSecureConnection is BLOCKING - use async version in seve activities
+
+// #if (HTTP_SERVER_TLS_SUPPORT == ENABLED)
+    error_t httpServerOpenSecureConnection(HttpServerContext *context, HttpConnection *connection);
+    
+    // DEPRECATED for seve/Reflex activities - this function BLOCKS
+    // Use httpServerEstablishSecureConnectionAsync() instead
+    error_t httpServerEstablishSecureConnection(HttpConnection *connection);
+    
+    error_t httpServerUserCertificateCallback(TlsContext *tlsContext, const X509CertificateInfo *certInfo, uint_t pathLen, void *param);
+// #endif
+
+error_t httpServerShutdownConnection(HttpConnection *connection);
+void httpServerCloseConnection(HttpConnection *connection);
+error_t httpServerSendData(HttpConnection *connection, const void *data, size_t length, size_t *written, uint_t flags);
+error_t httpServerReceiveData(HttpConnection *connection, void *data, size_t size, size_t *received, uint_t flags);
+void httpServerChangeState(HttpConnection *connection, HttpConnState newState);
+bool_t httpServerCheckTimeout(HttpConnection *connection, systime_t timeout);
+
+}
+
+// Pattern 2: Include the adapter layer for non-blocking TLS handshake
+#include "TlsHandshakeAdapter.h"
+
+// Pattern 3: Callback Wrapper - Async entry point for seve activities
+// Returns adapter that caller uses to drive handshake via progress() calls
+
+/**
+ * @brief Start a non-blocking TLS handshake on an HTTP connection
+ * 
+ * This is the non-blocking replacement for httpServerEstablishSecureConnection.
+ * Call this once to initialize, then call adapter->progress() each event loop tick.
+ * 
+ * Usage in seve Activity:
+ *   1. Call httpServerEstablishSecureConnectionAsync() - returns immediately
+ *   2. Store returned adapter in connection user data
+ *   3. Each tick: call adapter->progress()
+ *   4. When progress() returns DONE or ERROR, fire completion event
+ * 
+ * @param connection The HTTP connection (must have TLS context initialized via 
+ *                   httpServerOpenSecureConnection first)
+ * @param outAdapter Output parameter - receives pointer to adapter instance
+ *                   Caller is responsible for adapter lifetime management
+ * @return NO_ERROR on successful start, error code otherwise
+ * 
+ * IMPORTANT: This function returns immediately. The handshake is NOT complete
+ * until adapter->progress() returns TlsHandshakeStatus::DONE
+ */
+inline error_t httpServerEstablishSecureConnectionAsync(
+    HttpConnection* connection,
+    TlsHandshakeAdapter** outAdapter)
+{
+    // Validate parameters
+    if (connection == nullptr || outAdapter == nullptr) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    // Verify TLS context exists (should be created by httpServerOpenSecureConnection)
+    if (connection->tlsContext == nullptr) {
+        return ERROR_NOT_CONFIGURED;
+    }
+
+    // Pattern 2: Create adapter instance
+    // Memory management note: caller owns this instance and must delete when done
+    TlsHandshakeAdapter* adapter = new TlsHandshakeAdapter();
+    
+    // Pattern 3: start() returns immediately - no blocking
+    error_t error = adapter->start(connection);
+    
+    if (error != NO_ERROR) {
+        delete adapter;
+        *outAdapter = nullptr;
+        return error;
+    }
+
+    *outAdapter = adapter;
+    return NO_ERROR;
+}
+
+/**
+ * @brief Helper to check and advance TLS handshake in event loop tick
+ * 
+ * Designed to be called from seve Activity tick handler.
+ * Does ONE unit of work and returns immediately.
+ * 
+ * @param adapter The TLS handshake adapter
+ * @param outComplete Set to true when handshake is finished (success or error)
+ * @param outError Set to error code if handshake failed
+ * @return TlsHandshakeStatus indicating current state
+ */
+inline TlsHandshakeStatus httpServerTlsHandshakeTick(
+    TlsHandshakeAdapter* adapter,
+    bool* outComplete,
+    error_t* outError)
+{
+    if (adapter == nullptr) {
+        if (outComplete) *outComplete = true;
+        if (outError) *outError = ERROR_INVALID_PARAMETER;
+        return TlsHandshakeStatus::ERROR;
+    }
+
+    // Pattern 3: progress() does one small step and returns
+    // NO blocking, NO busy-wait
+    TlsHandshakeStatus status = adapter->progress();
+
+    switch (status) {
+        case TlsHandshakeStatus::DONE:
+            if (outComplete) *outComplete = true;
+            if (outError) *outError = NO_ERROR;
+            // Fire completion callback for event channel delivery
+            adapter->fireCompletion();
+            break;
+
+        case TlsHandshakeStatus::ERROR:
+            if (outComplete) *outComplete = true;
+            if (outError) *outError = adapter->getError();
+            // Fire completion callback with error
+            adapter->fireCompletion();
+            break;
+
+        case TlsHandshakeStatus::IN_PROGRESS:
+        default:
+            if (outComplete) *outComplete = false;
+            if (outError) *out

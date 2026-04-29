@@ -1,0 +1,16 @@
+You are a repair agent. A previous code generation failed review.
+
+SYSTEM CONTEXT:
+{knowledge}
+
+ORIGINAL CODE:
+{original}
+
+REJECTED TRANSFORMED CODE:
+{transformed}
+
+REVIEW FAILURES:
+{failures}
+
+Fix only the specific violations listed. Do not change anything else.
+Output the corrected code only.
